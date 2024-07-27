@@ -1,0 +1,56 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "displayName": "Base Config",
+      "description": "Base build using Ninja generator",
+      "generator": "Ninja",
+      "architecture": {
+        "value": "amd64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "hidden": true,
+      "inherits": "base",
+      "name": "windows-base",
+      "displayName": "Windows Config",
+      "description": "Default build using Ninja generator",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_CXX_COMPILER": "cl.exe"
+      }
+    },
+    {
+      "inherits": "windows-base",
+      "name": "windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "inherits": "windows-base",
+      "name": "windows-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "configurePreset": "windows-debug",
+      "name": "windows-debug"
+    },
+    {
+      "configurePreset": "windows-release",
+      "name": "windows-release"
+    }
+  ]
+}

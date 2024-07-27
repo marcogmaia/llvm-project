@@ -11,31 +11,13 @@
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/LLVM.h"
-#include "llvm/Support/Error.h"
+#include "llvm/ADT/STLExtras.h"
 #include <AST.h>
-#include <climits>
-#include <memory>
-#include <optional>
 #include <string>
 
 namespace clang {
 namespace clangd {
 namespace {
-
-/// Expand the "auto" type to the derived type
-/// Before:
-///    auto x = Something();
-///    ^^^^
-/// After:
-///    MyClass x = Something();
-///    ^^^^^^^
-/// Expand `decltype(expr)` to the deduced type
-/// Before:
-///   decltype(0) i;
-///   ^^^^^^^^^^^
-/// After:
-///   int i;
-///   ^^^
 
 class OverridePureVirtuals : public Tweak {
 public:
@@ -56,46 +38,38 @@ private:
 
 REGISTER_TWEAK(OverridePureVirtuals)
 
-// static bool recursivelyOverrides(const CXXMethodDecl *DerivedMD,
-//                                  const CXXMethodDecl *BaseMD) {
-//   for (const CXXMethodDecl *MD : DerivedMD->overridden_methods()) {
-//     if (MD->getCanonicalDecl() == BaseMD->getCanonicalDecl())
-//       return true;
-//     if (recursivelyOverrides(MD, BaseMD))
-//       return true;
-//   }
-//   return false;
-// }
-
 std::vector<const CXXMethodDecl *>
 getAllVirtualMethods(std::vector<const CXXRecordDecl *> Decls) {
   std::vector<const CXXMethodDecl *> Result;
-  std::function<void(const CXXRecordDecl *)> AddVirtualMethods =
-      [&](const CXXRecordDecl *Decl) {
-        if (!Decl) {
-          return;
-        }
-
-        // Add virtual methods from the current class
-        for (const auto *Method : Decl->methods()) {
-          if (const auto *CXXMethod = dyn_cast<CXXMethodDecl>(Method);
-              CXXMethod->isVirtual()) {
-            Result.emplace_back(CXXMethod);
-          }
-        }
-
-        // Recursively add virtual methods from base classes
-        for (const auto &Base : Decl->bases()) {
-          if (const CXXRecordDecl *BaseDecl =
-                  Base.getType()->getAsCXXRecordDecl()) {
-            AddVirtualMethods(BaseDecl);
-          }
-        }
-      };
+  std::function<void(const CXXRecordDecl *)> AddVirtualMethods;
+  AddVirtualMethods = [&Result, &AddVirtualMethods](const CXXRecordDecl *Decl) {
+    if (!Decl) {
+      return;
+    }
+    // Add virtual methods from the current class.
+    std::copy_if(Decl->method_begin(), Decl->method_end(),
+                 std::back_inserter(Result),
+                 [](CXXMethodDecl *M) { return M->isPureVirtual(); });
+    // Recursively add virtual methods from base classes.
+    for (const auto &Base : Decl->bases()) {
+      if (const CXXRecordDecl *BaseDecl =
+              Base.getType()->getAsCXXRecordDecl()) {
+        AddVirtualMethods(BaseDecl->getCanonicalDecl());
+      }
+    }
+  };
   for (auto &Decl : Decls) {
     AddVirtualMethods(Decl);
   }
   return Result;
+}
+
+std::vector<const CXXMethodDecl *> getOverridenMethods(const CXXRecordDecl *D) {
+  std::vector<const CXXMethodDecl *> R;
+  for (const CXXMethodDecl *M : D->methods()) {
+    llvm::append_range(R, llvm::to_vector(M->overridden_methods()));
+  }
+  return R;
 }
 
 bool OverridePureVirtuals::prepare(const Selection &Sel) {
@@ -119,9 +93,27 @@ bool OverridePureVirtuals::prepare(const Selection &Sel) {
   }
 
   auto BaseVirtualMethods = getAllVirtualMethods(Bases);
+  auto OverridenMethods = getOverridenMethods(CurrentDecl);
 
-  // TODO(marco): Remove the already implemented methods
-  PureVirtualMethods = BaseVirtualMethods;
+  std::set<const CXXMethodDecl *> OverridenSet;
+  std::transform(OverridenMethods.begin(), OverridenMethods.end(),
+                 std::inserter(OverridenSet, OverridenSet.end()),
+                 [](const CXXMethodDecl *D) { return D->getCanonicalDecl(); });
+
+  // Remove all the overriden methods from the list of methods that we want
+  // to apply for the signature.
+  std::copy_if(BaseVirtualMethods.begin(), BaseVirtualMethods.end(),
+               std::back_inserter(PureVirtualMethods),
+               [&OverridenSet](const CXXMethodDecl *D) {
+                 bool AlreadyOverriden =
+                     OverridenSet.find(D->getCanonicalDecl()) !=
+                     OverridenSet.end();
+                 return !AlreadyOverriden;
+               });
+
+  // BaseVirtualMethods.front()->getCanonicalDecl()
+
+  // PureVirtualMethods = BaseVirtualMethods;
 
   return !PureVirtualMethods.empty();
 }
