@@ -117,6 +117,7 @@ add_unittest(ClangdUnitTests ClangdTests
   support/ThreadingTests.cpp
   support/TraceTests.cpp
 
+  tweaks/AddPureVirtualOverrideTest.cpp
   tweaks/AddUsingTests.cpp
   tweaks/AnnotateHighlightingsTests.cpp
   tweaks/DefineInlineTests.cpp

@@ -1,0 +1,57 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "displayName": "Base Config",
+      "description": "Base build using Ninja generator",
+      "generator": "Ninja",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "hidden": true,
+      "inherits": "base",
+      "name": "linux-base",
+      "displayName": "Windows Config",
+      "description": "Default build using Ninja generator",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true
+      }
+    },
+    {
+      "inherits": "linux-base",
+      "name": "linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "inherits": "linux-base",
+      "name": "linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "configurePreset": "linux-debug",
+      "name": "linux-debug"
+    },
+    {
+      "configurePreset": "linux-release",
+      "name": "linux-release"
+    }
+  ]
+}
