@@ -12,7 +12,7 @@
       "description": "Base build using Ninja generator",
       "generator": "Ninja",
       "architecture": {
-        "value": "amd64",
+        "value": "x64",
         "strategy": "external"
       },
       "binaryDir": "${sourceDir}/build/${presetName}"
@@ -23,6 +23,10 @@
       "name": "windows-base",
       "displayName": "Windows Config",
       "description": "Default build using Ninja generator",
+      "toolset": {
+        "strategy": "external",
+        "value": "v143,host=x64"
+      },
       "cacheVariables": {
         "CMAKE_C_COMPILER": "cl.exe",
         "CMAKE_CXX_COMPILER": "cl.exe"
@@ -32,7 +36,7 @@
       "inherits": "windows-base",
       "name": "windows-release",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     },
     {
