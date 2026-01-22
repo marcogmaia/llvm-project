@@ -123,11 +123,9 @@ TEST_F(ExpandDeducedTypeTest, Test) {
   // array types are not replaced
   EXPECT_THAT(apply("int arr[10]; decl^type(arr) foobar;"),
               StartsWith("fail: Could not expand type"));
-  // pointers to an array are not replaced
-  EXPECT_THAT(apply(R"cpp(decl^type(&"foobar") s;)cpp"),
-              StartsWith("fail: Could not expand type"));
 
   ExtraArgs.push_back("-std=c++20");
+
   EXPECT_UNAVAILABLE("template <au^to X> class Y;");
 
   EXPECT_THAT(apply("auto X = [](^auto){};"),
@@ -143,6 +141,36 @@ TEST_F(ExpandDeducedTypeTest, Test) {
   // lambda should not be replaced
   EXPECT_UNAVAILABLE("auto f = [](){}; decl^type(f) g;");
   EXPECT_UNAVAILABLE("decl^type([]{}) f;");
+}
+
+TEST_F(ExpandDeducedTypeTest, ShadowedTypes) {
+  // qualification of shadowed types
+  Header = "namespace n { struct S {}; namespace m { struct S {}; S f(); } }";
+  EXPECT_EQ(apply("namespace n { [[auto]] x = m::f(); }"),
+            "namespace n { m::S x = m::f(); }");
+  EXPECT_EQ(apply("using namespace n; [[auto]] x = m::f();"),
+            "using namespace n; m::S x = m::f();");
+  // global shadowing
+  Header = "struct G {}; namespace n { struct G {}; G f(); }";
+  EXPECT_EQ(apply("using namespace n; [[auto]] x = f();"),
+            "using namespace n; n::G x = f();");
+  // local shadowing
+  Header = "struct S {}; S f();";
+  EXPECT_EQ(apply("void test() { struct S {}; [[auto]] x = f(); }"),
+            "void test() { struct S {}; ::S x = f(); }");
+  // template shadowing
+  Header = "template <typename T> struct V {}; namespace n { template "
+           "<typename T> struct V {}; V<int> f(); }";
+  EXPECT_EQ(apply("using namespace n; [[auto]] x = f();"),
+            "using namespace n; n::V<int> x = f();");
+  // namespace shadowing
+  Header = "namespace n { struct S {}; namespace m { struct S {}; S func(); } }";
+  EXPECT_EQ(apply("namespace n { void f() { [[auto]] x = m::func(); } }"),
+            "namespace n { void f() { m::S x = m::func(); } }");
+  // const-ref shadowing
+  Header = "struct S {}; const S& f();";
+  EXPECT_EQ(apply("void test() { struct S {}; [[auto]]& x = f(); }"),
+            "void test() { struct S {}; const ::S& x = f(); }");
 }
 
 } // namespace

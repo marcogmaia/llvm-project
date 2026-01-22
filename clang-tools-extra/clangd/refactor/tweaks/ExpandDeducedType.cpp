@@ -7,20 +7,227 @@
 //===----------------------------------------------------------------------===//
 #include "refactor/Tweak.h"
 
+#include "AST.h"
 #include "support/Logger.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
+#include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
-#include "llvm/Support/Error.h"
-#include <AST.h>
-#include <climits>
-#include <memory>
+#include "llvm/ADT/DenseSet.h"
 #include <optional>
 #include <string>
 
 namespace clang {
 namespace clangd {
 namespace {
+
+// Copied from AST.cpp since it's not public.
+llvm::DenseSet<const NamespaceDecl *>
+getUsingNamespaceDirectives(const DeclContext *DestContext,
+                            SourceLocation Until) {
+  const auto &SM = DestContext->getParentASTContext().getSourceManager();
+  llvm::DenseSet<const NamespaceDecl *> VisibleNamespaceDecls;
+  for (const auto *DC = DestContext; DC; DC = DC->getLookupParent()) {
+    for (const auto *D : DC->decls()) {
+      if (!SM.isWrittenInSameFile(D->getLocation(), Until) ||
+          !SM.isBeforeInTranslationUnit(D->getLocation(), Until))
+        continue;
+      if (auto *UDD = llvm::dyn_cast<UsingDirectiveDecl>(D))
+        VisibleNamespaceDecls.insert(
+            UDD->getNominatedNamespace()->getCanonicalDecl());
+    }
+  }
+  return VisibleNamespaceDecls;
+}
+
+const NamedDecl *resolveTagOrTemplateDecl(QualType Type) {
+  if (const auto *TT = Type->getAs<TagType>())
+    return TT->getDecl();
+  if (const auto *TST = Type->getAs<TemplateSpecializationType>())
+    return TST->getTemplateName().getAsTemplateDecl();
+  return nullptr;
+}
+
+struct DeducedTypeVisitor {
+  enum class QualificationStrategy { Prefix, Full };
+
+  // Checks if the 'Name' is defined in 'Context' and refers to something other
+  // than 'Target'.
+  static bool hasNameCollision(const DeclContext *Context,
+                               const NamedDecl *Target) {
+    for (const auto *D : Context->lookup(Target->getDeclName())) {
+      if (D != Target && D->getCanonicalDecl() != Target->getCanonicalDecl())
+        return true;
+    }
+    return false;
+  }
+
+  // Check if any declaration in the DeclStmt collides with Target.
+  static bool shadowsInDeclStmt(const DeclStmt *DS, const NamedDecl *Target) {
+    for (const Decl *D : DS->decls()) {
+      if (const auto *NdLocal = dyn_cast<NamedDecl>(D)) {
+        if (NdLocal->getDeclName() == Target->getDeclName())
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // Check for shadowing within a CompoundStmt up to the current node.
+  static bool shadowsInCompoundStmt(const CompoundStmt *CS,
+                                    const Stmt *CurrentNode,
+                                    const NamedDecl *Target) {
+    for (const Stmt *S : CS->body()) {
+      if (S == CurrentNode)
+        break;
+      if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+        if (shadowsInDeclStmt(DS, Target))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // Check if function parameters shadow the target.
+  static bool shadowsInFunctionDecl(const FunctionDecl *FD,
+                                    const NamedDecl *Target) {
+    for (const auto *P : FD->parameters()) {
+      if (P->getDeclName() == Target->getDeclName())
+        return true;
+    }
+    return false;
+  }
+
+  // Checks if 'Target' is shadowed by a local declaration in the scope chain
+  // starting from 'Node' (in 'SelectionTree') up to the 'CurContext'.
+  static bool isShadowed(const NamedDecl *Target, const DeclContext *CurContext,
+                         const SelectionTree::Node *Node) {
+    // Check for shadowing in the current DeclContext chain (up to TU).
+    for (const DeclContext *DC = CurContext; DC && !DC->isTranslationUnit();
+         DC = DC->getLookupParent()) {
+      if (hasNameCollision(DC, Target))
+        return true;
+    }
+
+    // Check for shadowing in local scopes (function bodies, blocks)
+    // which are not captured by DeclContext lookup.
+    for (const SelectionTree::Node *Parent = Node->Parent; Parent;
+         Node = Parent, Parent = Parent->Parent) {
+      if (const auto *CS = Parent->ASTNode.get<CompoundStmt>()) {
+        if (shadowsInCompoundStmt(CS, Node->ASTNode.get<Stmt>(), Target))
+          return true;
+      } else if (const auto *FD = Parent->ASTNode.get<FunctionDecl>()) {
+        if (shadowsInFunctionDecl(FD, Target))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // Determines the qualification strategy for 'ND' at 'Loc'.
+  static QualificationStrategy
+  computeStrategy(ASTContext &Context, const DeclContext *CurContext,
+                  const SelectionTree::Node *Node, SourceLocation Loc,
+                  const NamedDecl *ND, std::string &Prefix) {
+    Prefix = getQualification(Context, CurContext, Loc, ND);
+
+    // If Qualification is empty, we must ensure that the simple name is NOT
+    // ambiguous in the current context (e.g. via 'using namespace').
+    if (Prefix.empty()) {
+      bool IsAmbiguous = false;
+      // Check for ambiguity with global scope
+      const auto *TU = Context.getTranslationUnitDecl();
+      if (hasNameCollision(TU, ND))
+        IsAmbiguous = true;
+
+      // Check for shadowing in the current scope chain
+      if (!IsAmbiguous && isShadowed(ND, CurContext, Node))
+        IsAmbiguous = true;
+
+      // Check visible namespaces
+      if (!IsAmbiguous) {
+        auto VisibleNS = getUsingNamespaceDirectives(CurContext, Loc);
+        for (const auto *NS : VisibleNS) {
+          if (hasNameCollision(NS, ND)) {
+            IsAmbiguous = true;
+            break;
+          }
+        }
+      }
+
+      if (IsAmbiguous)
+        return QualificationStrategy::Full;
+    }
+    return QualificationStrategy::Prefix;
+  }
+
+  static std::string getQualifiedName(ASTContext &Context,
+                                      const DeclContext *CurContext,
+                                      const SelectionTree::Node *Node,
+                                      SourceLocation Loc, const NamedDecl *ND) {
+    std::string Prefix;
+    QualificationStrategy Strategy =
+        computeStrategy(Context, CurContext, Node, Loc, ND, Prefix);
+
+    if (Strategy == QualificationStrategy::Full) {
+      std::string FQName;
+      llvm::raw_string_ostream OS(FQName);
+      ND->printQualifiedName(OS);
+      if (ND->getDeclContext()->isTranslationUnit())
+        return "::" + OS.str();
+      return OS.str();
+    }
+    return Prefix + ND->getNameAsString();
+  }
+};
+
+std::string injectQualifier(llvm::StringRef TypeString,
+                            llvm::StringRef UnqualifiedName,
+                            llvm::StringRef QualifiedName) {
+  llvm::StringRef ShortName = TypeString;
+  ShortName = ShortName.rtrim();
+
+  // Find the name in the string.
+  // We need to be careful not to match substrings (e.g. "Names" vs "Name").
+  // We also need to handle qualifiers (const/volatile) and pointers/refs.
+  size_t Pos = ShortName.find(UnqualifiedName);
+  if (Pos != llvm::StringRef::npos) {
+    // Check if it's a whole word match.
+    bool StartOk =
+        (Pos == 0) || !isAsciiIdentifierContinue(
+                          static_cast<unsigned char>(ShortName[Pos - 1]));
+    bool EndOk = (Pos + UnqualifiedName.size() == ShortName.size()) ||
+                 !isAsciiIdentifierContinue(static_cast<unsigned char>(
+                     ShortName[Pos + UnqualifiedName.size()]));
+
+    if (StartOk && EndOk) {
+      if (!QualifiedName.empty() && QualifiedName != UnqualifiedName) {
+        // We have a qualified name, check if the current name is already
+        // fully qualified.
+        // We do this by checking if the text *before* the match ends with
+        // the qualification prefix.
+        // e.g. QualifiedName = "ns::Class::Nested", UnqualifiedName = "Nested"
+        // ExpectedPrefix = "ns::Class::"
+        // ShortName = "ns::Class::Nested" -> Pos of Nested is 11.
+        // ShortName.substr(0, 11) is "ns::Class::", which matches.
+
+        // Handle "::" global scope properly
+        llvm::StringRef ExpectedPrefix = QualifiedName;
+        if (ExpectedPrefix.ends_with(UnqualifiedName))
+          ExpectedPrefix = ExpectedPrefix.drop_back(UnqualifiedName.size());
+
+        if (!ShortName.substr(0, Pos).ends_with(ExpectedPrefix)) {
+          return (ShortName.take_front(Pos) + ExpectedPrefix +
+                  ShortName.drop_front(Pos))
+              .str();
+        }
+      }
+    }
+  }
+  return TypeString.str();
+}
 
 /// Expand the "auto" type to the derived type
 /// Before:
@@ -155,9 +362,32 @@ Expected<Tweak::Effect> ExpandDeducedType::apply(const Selection &Inputs) {
   // ==>
   //   void (*fptr)() = &func;
   // Replacing these requires examining the declarator, we don't support it yet.
-  std::string PrettyDeclarator = printType(
-      *DeducedType, Inputs.ASTSelection.commonAncestor()->getDeclContext(),
-      "DECLARATOR_ID");
+  const DeclContext &CurContext =
+      Inputs.ASTSelection.commonAncestor()->getDeclContext();
+
+  std::string PrettyDeclarator =
+      printType(*DeducedType, CurContext, "DECLARATOR_ID");
+
+  // If the deduced type is a simple record/enum or a template specialization,
+  // we can try to improve the qualification if it's currently ambiguous.
+  if (const NamedDecl *ND = resolveTagOrTemplateDecl(*DeducedType)) {
+    if (ND->getIdentifier()) {
+      std::string QualifiedName = DeducedTypeVisitor::getQualifiedName(
+          Inputs.AST->getASTContext(), &CurContext,
+          Inputs.ASTSelection.commonAncestor(), Range.getBegin(), ND);
+
+      if (QualifiedName != ND->getNameAsString()) {
+        llvm::StringRef ShortName = PrettyDeclarator;
+        if (ShortName.consume_back("DECLARATOR_ID")) {
+          std::string NewDeclarator =
+              injectQualifier(ShortName, ND->getName(), QualifiedName);
+          if (NewDeclarator != ShortName)
+            PrettyDeclarator = NewDeclarator + " DECLARATOR_ID";
+        }
+      }
+    }
+  }
+
   llvm::StringRef PrettyTypeName = PrettyDeclarator;
   if (!PrettyTypeName.consume_back("DECLARATOR_ID"))
     return error("Could not expand type that isn't a simple string");
