@@ -68,6 +68,9 @@ struct DeducedTypeVisitor {
   static bool shadowsInDeclStmt(const DeclStmt *DS, const NamedDecl *Target) {
     for (const Decl *D : DS->decls()) {
       if (const auto *NdLocal = dyn_cast<NamedDecl>(D)) {
+        // Ignore the target itself (we don't shadow ourselves).
+        if (NdLocal->getCanonicalDecl() == Target->getCanonicalDecl())
+          continue;
         if (NdLocal->getDeclName() == Target->getDeclName())
           return true;
       }
@@ -126,6 +129,52 @@ struct DeducedTypeVisitor {
     return false;
   }
 
+  // Check if we can use the immediate parent namespace as a prefix.
+  static bool canUseParentPrefix(const NamedDecl *Target,
+                                 const DeclContext *CurContext,
+                                 const SelectionTree::Node *Node,
+                                 std::string &Prefix) {
+    // Walk up the DeclContexts of the Target to find the first safe prefix
+    const DeclContext *DC = Target->getDeclContext();
+    std::string AccumPrefix = "";
+
+    while (DC && !DC->isTranslationUnit()) {
+      const auto *NS = dyn_cast<NamespaceDecl>(DC);
+      if (!NS || NS->isAnonymousNamespace() || NS->isInlineNamespace()) {
+        DC = DC->getParent();
+        continue;
+      }
+
+      AccumPrefix = NS->getNameAsString() + "::" + AccumPrefix;
+
+      // Check if this accumulated prefix is safe (not shadowed and no
+      // collisions) We need to check if the *first* component of the prefix is
+      // shadowed. Actually, we need to check if the fully formed Name with this
+      // prefix resolves to the Target. But simply checking if the top-level
+      // namespace in the prefix is safe is a good heuristic for "Is this path
+      // valid?".
+
+      // However, isShadowed/hasNameCollision expects a NamedDecl.
+      // We should check if 'NS' (the top of the chain we just added) is safe.
+      // But 'NS' is the *inner* namespace in the previous loop iteration?
+      // No, we are walking UP from Target.
+      // Iteration 1: DC = Parent of Target. AccumPrefix = "Parent::".
+      // Iteration 2: DC = GrandParent. AccumPrefix = "GrandParent::Parent::".
+
+      // If we use "GrandParent::Parent::", we need "GrandParent" to be
+      // visible/safe.
+      if (!isShadowed(NS, CurContext, Node) &&
+          !hasNameCollision(CurContext, NS)) {
+        Prefix = AccumPrefix;
+        return true;
+      }
+
+      DC = DC->getParent();
+    }
+
+    return false;
+  }
+
   // Determines the qualification strategy for 'ND' at 'Loc'.
   static QualificationStrategy
   computeStrategy(ASTContext &Context, const DeclContext *CurContext,
@@ -157,8 +206,11 @@ struct DeducedTypeVisitor {
         }
       }
 
-      if (IsAmbiguous)
+      if (IsAmbiguous) {
+        if (canUseParentPrefix(ND, CurContext, Node, Prefix))
+          return QualificationStrategy::Prefix;
         return QualificationStrategy::Full;
+      }
     }
     return QualificationStrategy::Prefix;
   }

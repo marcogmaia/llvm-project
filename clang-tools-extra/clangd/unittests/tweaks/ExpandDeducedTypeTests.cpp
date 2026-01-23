@@ -123,9 +123,11 @@ TEST_F(ExpandDeducedTypeTest, Test) {
   // array types are not replaced
   EXPECT_THAT(apply("int arr[10]; decl^type(arr) foobar;"),
               StartsWith("fail: Could not expand type"));
+  // pointers to an array are not replaced
+  EXPECT_THAT(apply(R"cpp(decl^type(&"foobar") s;)cpp"),
+              StartsWith("fail: Could not expand type"));
 
   ExtraArgs.push_back("-std=c++20");
-
   EXPECT_UNAVAILABLE("template <au^to X> class Y;");
 
   EXPECT_THAT(apply("auto X = [](^auto){};"),
@@ -164,13 +166,73 @@ TEST_F(ExpandDeducedTypeTest, ShadowedTypes) {
   EXPECT_EQ(apply("using namespace n; [[auto]] x = f();"),
             "using namespace n; n::V<int> x = f();");
   // namespace shadowing
-  Header = "namespace n { struct S {}; namespace m { struct S {}; S func(); } }";
+  Header =
+      "namespace n { struct S {}; namespace m { struct S {}; S func(); } }";
   EXPECT_EQ(apply("namespace n { void f() { [[auto]] x = m::func(); } }"),
             "namespace n { void f() { m::S x = m::func(); } }");
   // const-ref shadowing
   Header = "struct S {}; const S& f();";
   EXPECT_EQ(apply("void test() { struct S {}; [[auto]]& x = f(); }"),
             "void test() { struct S {}; const ::S& x = f(); }");
+
+  Header = "";
+  EXPECT_EQ(apply(R"cpp(namespace outer {
+namespace n {
+struct S {};
+namespace m {
+struct S {};
+constexpr n::S func() {
+  return n::S{};
+}
+constexpr [[auto]] var = m::func();
+}  // namespace m
+}  // namespace n
+}  // namespace outer
+)cpp"),
+            R"cpp(namespace outer {
+namespace n {
+struct S {};
+namespace m {
+struct S {};
+constexpr n::S func() {
+  return n::S{};
+}
+constexpr n::S var = m::func();
+}  // namespace m
+}  // namespace n
+}  // namespace outer
+)cpp");
+
+  // check iterative qualification (2 hops)
+  Header = R"cpp(
+    namespace grandparent {
+      namespace parent {
+        struct S {};
+      }
+    }
+  )cpp";
+  EXPECT_EQ(apply(R"cpp(
+    namespace grandparent {
+      namespace parent {
+        void test() {
+          // Shadow parent locally
+          struct parent {};
+          [[auto]] x = grandparent::parent::S();
+        }
+      }
+    }
+  )cpp"),
+            R"cpp(
+    namespace grandparent {
+      namespace parent {
+        void test() {
+          // Shadow parent locally
+          struct parent {};
+          grandparent::parent::S x = grandparent::parent::S();
+        }
+      }
+    }
+  )cpp");
 }
 
 } // namespace
