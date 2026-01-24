@@ -220,6 +220,24 @@ std::string getQualification(ASTContext &Context,
                              const NamedDecl *ND,
                              llvm::ArrayRef<std::string> VisibleNamespaces);
 
+/// Returns the shortest qualified name for ND that is valid and unambiguous at
+/// Loc within DestContext.
+///
+/// This function considers:
+/// - Shadowing from local variables or other declarations reachable from Node.
+/// - Name collisions with declarations from 'using namespace' directives at
+///   Loc.
+/// - The shortest possible qualification (e.g., omitting namespace prefixes if
+///   already within that namespace or if it's visible via using-directives).
+///
+/// Resolver is used to resolve names in dependent contexts (e.g., template
+/// code). Node is the AST node at Loc where the name will be spelled, used to
+/// detect shadowing in the local scope.
+std::string getQualification(ASTContext &Ctx, const HeuristicResolver *Resolver,
+                             const DeclContext *DestContext,
+                             const DynTypedNode &Node, SourceLocation Loc,
+                             const NamedDecl *ND);
+
 /// Whether we must avoid computing linkage for D during code completion.
 /// Clang aggressively caches linkage computation, which is stable after the AST
 /// is built. Unfortunately the AST is incomplete during code completion, so

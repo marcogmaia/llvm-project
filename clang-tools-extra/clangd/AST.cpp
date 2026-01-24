@@ -18,6 +18,7 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
@@ -156,6 +157,169 @@ std::string getQualification(ASTContext &Context,
   llvm::raw_string_ostream OS(Result);
   Qualifier.print(OS, Context.getPrintingPolicy());
   return OS.str();
+}
+
+// Check if any declaration in the DeclStmt collides with Target.
+bool shadowsInDeclStmt(const HeuristicResolver *Resolver, const DeclStmt *DS,
+                       const NamedDecl *Target) {
+  for (const Decl *D : DS->decls()) {
+    if (const auto *NdLocal = dyn_cast<NamedDecl>(D)) {
+      // Ignore the target itself (we don't shadow ourselves).
+      if (NdLocal->getCanonicalDecl() == Target->getCanonicalDecl())
+        continue;
+      if (NdLocal->getDeclName() == Target->getDeclName())
+        return true;
+    }
+  }
+  return false;
+}
+
+// Check for shadowing within a CompoundStmt up to the current node.
+bool shadowsInCompoundStmt(const HeuristicResolver *Resolver,
+                           const CompoundStmt *CS, const Stmt *CurrentNode,
+                           const NamedDecl *Target) {
+  for (const Stmt *S : CS->body()) {
+    if (S == CurrentNode)
+      break;
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      if (shadowsInDeclStmt(Resolver, DS, Target))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Check if function parameters shadow the target.
+bool shadowsInFunctionDecl(const HeuristicResolver *Resolver,
+                           const FunctionDecl *FD, const NamedDecl *Target) {
+  for (const auto *P : FD->parameters()) {
+    if (P->getDeclName() == Target->getDeclName())
+      return true;
+  }
+  return false;
+}
+
+bool hasNameCollision(const HeuristicResolver *Resolver,
+                      const DeclContext *Context, const NamedDecl *Target) {
+  if (const auto *RD = dyn_cast<CXXRecordDecl>(Context)) {
+    // lookupDependentName handles both concrete and dependent bases.
+    // lookupDependentName is not const.
+    auto Results =
+        const_cast<HeuristicResolver *>(Resolver)->lookupDependentName(
+            const_cast<CXXRecordDecl *>(RD), Target->getDeclName(),
+            [&](const NamedDecl *D) {
+              return D != Target &&
+                     D->getCanonicalDecl() != Target->getCanonicalDecl();
+            });
+    return !Results.empty();
+  }
+
+  for (const auto *D : Context->lookup(Target->getDeclName())) {
+    if (D != Target && D->getCanonicalDecl() != Target->getCanonicalDecl())
+      return true;
+  }
+  return false;
+}
+
+bool isShadowed(const HeuristicResolver *Resolver, const NamedDecl *Target,
+                const DeclContext *CurContext, const DynTypedNode &Node) {
+  // Check for shadowing in local scopes (function bodies, blocks)
+  // which are not captured by DeclContext lookup.
+  ASTContext &Ctx = Target->getASTContext();
+  for (DynTypedNode Current = Node;;) {
+    auto Parents = Ctx.getParents(Current);
+    if (Parents.empty())
+      break;
+    const DynTypedNode &Parent = Parents[0];
+
+    if (const auto *CS = Parent.get<CompoundStmt>()) {
+      if (shadowsInCompoundStmt(Resolver, CS, Current.get<Stmt>(), Target))
+        return true;
+    } else if (const auto *FD = Parent.get<FunctionDecl>()) {
+      if (shadowsInFunctionDecl(Resolver, FD, Target))
+        return true;
+    }
+    Current = Parent;
+    // Stop if we reach the DeclContext.
+    if (const Decl *D = Current.get<Decl>()) {
+      if (const DeclContext *DC = dyn_cast<DeclContext>(D)) {
+        if (DC == CurContext)
+          break;
+      }
+    }
+  }
+
+  // Check for shadowing in the current DeclContext chain (up to TU).
+  for (const DeclContext *DC = CurContext; DC; DC = DC->getLookupParent()) {
+    if (hasNameCollision(Resolver, DC, Target))
+      return true;
+    if (DC == Target->getDeclContext())
+      return false;
+  }
+
+  return false;
+}
+
+enum class QualificationStrategy { Prefix, Full };
+
+// Tries to find a partial namespace prefix from the target's enclosing
+// namespaces that resolves ambiguity or shadowing.
+bool canUseParentPrefix(const HeuristicResolver *Resolver,
+                        const NamedDecl *Target, const DeclContext *CurContext,
+                        const DynTypedNode &Node, std::string &Prefix) {
+  const DeclContext *DC = Target->getDeclContext();
+  std::string AccumPrefix = "";
+
+  while (DC && !DC->isTranslationUnit()) {
+    const auto *NS = dyn_cast<NamespaceDecl>(DC);
+    if (!NS || NS->isAnonymousNamespace() || NS->isInlineNamespace()) {
+      DC = DC->getParent();
+      continue;
+    }
+
+    AccumPrefix = NS->getNameAsString() + "::" + AccumPrefix;
+
+    if (!isShadowed(Resolver, NS, CurContext, Node) &&
+        !hasNameCollision(Resolver, CurContext, NS)) {
+      // The outermost namespace of the current prefix is accessible.
+      Prefix = AccumPrefix;
+      return true;
+    }
+
+    DC = DC->getParent();
+  }
+
+  return false;
+}
+
+// Determines the qualification strategy for 'ND' at 'Loc'.
+QualificationStrategy
+computeStrategy(ASTContext &Context, const HeuristicResolver *Resolver,
+                const DeclContext *CurContext, const DynTypedNode &Node,
+                SourceLocation Loc, const NamedDecl *ND, std::string &Prefix) {
+  Prefix = clangd::getQualification(Context, CurContext, Loc, ND);
+
+  // If we already have a qualification, we trust it.
+  if (!Prefix.empty())
+    return QualificationStrategy::Prefix;
+
+  // We must ensure that the simple name is NOT ambiguous in the current context
+  // (e.g. via 'using namespace' or shadowing).
+  if (isShadowed(Resolver, ND, CurContext, Node)) {
+    if (canUseParentPrefix(Resolver, ND, CurContext, Node, Prefix))
+      return QualificationStrategy::Prefix;
+    return QualificationStrategy::Full;
+  }
+
+  for (const auto *NS : getUsingNamespaceDirectives(CurContext, Loc)) {
+    if (hasNameCollision(Resolver, NS, ND)) {
+      if (canUseParentPrefix(Resolver, ND, CurContext, Node, Prefix))
+        return QualificationStrategy::Prefix;
+      return QualificationStrategy::Full;
+    }
+  }
+
+  return QualificationStrategy::Prefix;
 }
 
 } // namespace
@@ -729,6 +893,25 @@ std::string getQualification(ASTContext &Context,
           return OS.str() == Namespace;
         });
       });
+}
+
+std::string getQualification(ASTContext &Ctx, const HeuristicResolver *Resolver,
+                             const DeclContext *DestContext,
+                             const DynTypedNode &Node, SourceLocation Loc,
+                             const NamedDecl *ND) {
+  std::string Prefix;
+  QualificationStrategy Strategy =
+      computeStrategy(Ctx, Resolver, DestContext, Node, Loc, ND, Prefix);
+
+  if (Strategy == QualificationStrategy::Full) {
+    std::string FQName;
+    llvm::raw_string_ostream OS(FQName);
+    ND->printQualifiedName(OS);
+    if (ND->getDeclContext()->isTranslationUnit())
+      return "::" + OS.str();
+    return OS.str();
+  }
+  return Prefix + ND->getNameAsString();
 }
 
 bool hasUnstableLinkage(const Decl *D) {
