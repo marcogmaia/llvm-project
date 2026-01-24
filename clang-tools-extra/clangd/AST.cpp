@@ -83,17 +83,23 @@ bool isTemplateSpecializationKind(const NamedDecl *D,
 // ancestor is redundant, therefore we stop at lowest common ancestor.
 // In addition to that stops early whenever IsVisible returns true. This can be
 // used to implement support for "using namespace" decls.
-std::string getQualification(ASTContext &Context,
-                             const DeclContext *DestContext,
-                             const DeclContext *SourceContext,
-                             llvm::function_ref<bool(const Decl *)> IsVisible) {
+std::string getQualification(
+    ASTContext &Context, const DeclContext *DestContext,
+    const DeclContext *SourceContext, const NamedDecl *Target,
+    llvm::function_ref<bool(const DeclContext *Ctx, const NamedDecl *Child)>
+        IsVisible) {
   std::vector<const Decl *> Parents;
   [[maybe_unused]] bool ReachedNS = false;
+
+  bool Stopped = false;
+  const NamedDecl *Child = Target;
   for (const DeclContext *CurContext = SourceContext; CurContext;
-       CurContext = CurContext->getLookupParent()) {
-    // Stop once we reach a common ancestor.
-    if (CurContext->Encloses(DestContext))
+       Child = dyn_cast<NamedDecl>(CurContext),
+                         CurContext = CurContext->getLookupParent()) {
+    if (Child && IsVisible(CurContext, Child)) {
+      Stopped = true;
       break;
+    }
 
     const Decl *CurD;
     if (auto *TD = llvm::dyn_cast<TagDecl>(CurContext)) {
@@ -112,16 +118,14 @@ std::string getQualification(ASTContext &Context,
       // them.
       continue;
     }
-    // Stop if this namespace is already visible at DestContext.
-    if (IsVisible(CurD))
-      break;
 
     Parents.push_back(CurD);
   }
 
   // Go over the declarations in reverse order, since we stored inner-most
   // parent first.
-  NestedNameSpecifier Qualifier = std::nullopt;
+  NestedNameSpecifier Qualifier =
+      !Stopped ? NestedNameSpecifier::getGlobal() : std::nullopt;
   bool IsFirst = true;
   for (const auto *CurD : llvm::reverse(Parents)) {
     if (auto *TD = llvm::dyn_cast<TagDecl>(CurD)) {
@@ -258,68 +262,6 @@ bool isShadowed(const HeuristicResolver *Resolver, const NamedDecl *Target,
   }
 
   return false;
-}
-
-enum class QualificationStrategy { Prefix, Full };
-
-// Tries to find a partial namespace prefix from the target's enclosing
-// namespaces that resolves ambiguity or shadowing.
-bool canUseParentPrefix(const HeuristicResolver *Resolver,
-                        const NamedDecl *Target, const DeclContext *CurContext,
-                        const DynTypedNode &Node, std::string &Prefix) {
-  const DeclContext *DC = Target->getDeclContext();
-  std::string AccumPrefix = "";
-
-  while (DC && !DC->isTranslationUnit()) {
-    const auto *NS = dyn_cast<NamespaceDecl>(DC);
-    if (!NS || NS->isAnonymousNamespace() || NS->isInlineNamespace()) {
-      DC = DC->getParent();
-      continue;
-    }
-
-    AccumPrefix = NS->getNameAsString() + "::" + AccumPrefix;
-
-    if (!isShadowed(Resolver, NS, CurContext, Node) &&
-        !hasNameCollision(Resolver, CurContext, NS)) {
-      // The outermost namespace of the current prefix is accessible.
-      Prefix = AccumPrefix;
-      return true;
-    }
-
-    DC = DC->getParent();
-  }
-
-  return false;
-}
-
-// Determines the qualification strategy for 'ND' at 'Loc'.
-QualificationStrategy
-computeStrategy(ASTContext &Context, const HeuristicResolver *Resolver,
-                const DeclContext *CurContext, const DynTypedNode &Node,
-                SourceLocation Loc, const NamedDecl *ND, std::string &Prefix) {
-  Prefix = clangd::getQualification(Context, CurContext, Loc, ND);
-
-  // If we already have a qualification, we trust it.
-  if (!Prefix.empty())
-    return QualificationStrategy::Prefix;
-
-  // We must ensure that the simple name is NOT ambiguous in the current context
-  // (e.g. via 'using namespace' or shadowing).
-  if (isShadowed(Resolver, ND, CurContext, Node)) {
-    if (canUseParentPrefix(Resolver, ND, CurContext, Node, Prefix))
-      return QualificationStrategy::Prefix;
-    return QualificationStrategy::Full;
-  }
-
-  for (const auto *NS : getUsingNamespaceDirectives(CurContext, Loc)) {
-    if (hasNameCollision(Resolver, NS, ND)) {
-      if (canUseParentPrefix(Resolver, ND, CurContext, Node, Prefix))
-        return QualificationStrategy::Prefix;
-      return QualificationStrategy::Full;
-    }
-  }
-
-  return QualificationStrategy::Prefix;
 }
 
 } // namespace
@@ -865,14 +807,19 @@ std::string getQualification(ASTContext &Context,
   auto VisibleNamespaceDecls =
       getUsingNamespaceDirectives(DestContext, InsertionPoint);
   return getQualification(
-      Context, DestContext, ND->getDeclContext(), [&](const Decl *D) {
-        if (D->getKind() != Decl::Namespace)
+      Context, DestContext, ND->getDeclContext(), ND,
+      [&](const DeclContext *Ctx, const NamedDecl *Child) {
+        if (!Child)
           return false;
-        const auto *NS = cast<NamespaceDecl>(D)->getCanonicalDecl();
-        return llvm::any_of(VisibleNamespaceDecls,
-                            [NS](const NamespaceDecl *NSD) {
-                              return NSD->getCanonicalDecl() == NS;
-                            });
+        if (Ctx->Encloses(DestContext))
+          return true;
+        if (const auto *NSD = dyn_cast<NamespaceDecl>(Ctx)) {
+          return llvm::any_of(
+              VisibleNamespaceDecls, [NSD](const NamespaceDecl *VNSD) {
+                return VNSD->getCanonicalDecl() == NSD->getCanonicalDecl();
+              });
+        }
+        return false;
       });
 }
 
@@ -885,12 +832,20 @@ std::string getQualification(ASTContext &Context,
     (void)NS;
   }
   return getQualification(
-      Context, DestContext, ND->getDeclContext(), [&](const Decl *D) {
+      Context, DestContext, ND->getDeclContext(), ND,
+      [&](const DeclContext *Ctx, const NamedDecl *Child) {
+        if (!Child)
+          return false;
+        if (Ctx->Encloses(DestContext))
+          return true;
         return llvm::any_of(VisibleNamespaces, [&](llvm::StringRef Namespace) {
           std::string NS;
           llvm::raw_string_ostream OS(NS);
-          D->print(OS, Context.getPrintingPolicy());
-          return OS.str() == Namespace;
+          if (const auto *D = dyn_cast<NamedDecl>(Ctx)) {
+            D->print(OS, Context.getPrintingPolicy());
+            return OS.str() + "::" == Namespace;
+          }
+          return false;
         });
       });
 }
@@ -899,19 +854,41 @@ std::string getQualification(ASTContext &Ctx, const HeuristicResolver *Resolver,
                              const DeclContext *DestContext,
                              const DynTypedNode &Node, SourceLocation Loc,
                              const NamedDecl *ND) {
-  std::string Prefix;
-  QualificationStrategy Strategy =
-      computeStrategy(Ctx, Resolver, DestContext, Node, Loc, ND, Prefix);
+  auto VisibleNamespaceDecls = getUsingNamespaceDirectives(DestContext, Loc);
+  return getQualification(
+      Ctx, DestContext, ND->getDeclContext(), ND,
+      [&](const DeclContext *Ctx, const NamedDecl *Child) {
+        if (!Child)
+          return false;
+        bool IsVisible = false;
+        if (Ctx->Encloses(DestContext)) {
+          IsVisible = true;
+        } else if (const auto *NSD = dyn_cast<NamespaceDecl>(Ctx)) {
+          IsVisible = llvm::any_of(
+              VisibleNamespaceDecls, [NSD](const NamespaceDecl *VNSD) {
+                return VNSD->getCanonicalDecl() == NSD->getCanonicalDecl();
+              });
+        }
 
-  if (Strategy == QualificationStrategy::Full) {
-    std::string FQName;
-    llvm::raw_string_ostream OS(FQName);
-    ND->printQualifiedName(OS);
-    if (ND->getDeclContext()->isTranslationUnit())
-      return "::" + OS.str();
-    return OS.str();
-  }
-  return Prefix + ND->getNameAsString();
+        if (!IsVisible)
+          return false;
+
+        // Even if visible, we can't stop if the name is shadowed.
+        if (isShadowed(Resolver, Child, DestContext, Node))
+          return false;
+        if (hasNameCollision(Resolver, DestContext, Child))
+          return false;
+
+        return true;
+      });
+}
+
+std::string getQualifiedName(ASTContext &Ctx, const HeuristicResolver *Resolver,
+                             const DeclContext *DestContext,
+                             const DynTypedNode &Node, SourceLocation Loc,
+                             const NamedDecl *ND) {
+  return getQualification(Ctx, Resolver, DestContext, Node, Loc, ND) +
+         ND->getNameAsString();
 }
 
 bool hasUnstableLinkage(const Decl *D) {

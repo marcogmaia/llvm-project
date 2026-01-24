@@ -95,7 +95,9 @@ computeDeducedTypeName(ASTContext &Ctx, const HeuristicResolver *Resolver,
   }
 
   std::string QualifiedName =
-      getQualification(Ctx, Resolver, &CurContext, Node->ASTNode, Loc, ND);
+      getQualification(Ctx, Resolver, &CurContext, Node->ASTNode, Loc, ND) +
+      ND->getName().str();
+
   if (QualifiedName != ND->getNameAsString()) {
     llvm::StringRef ShortName = PrettyDeclarator;
     if (ShortName.consume_back("DECLARATOR_ID")) {

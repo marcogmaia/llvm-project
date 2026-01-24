@@ -19,7 +19,6 @@
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
-#include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"
@@ -27,7 +26,6 @@
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Token.h"
-#include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Tooling/Core/Replacement.h"
 #include "llvm/ADT/DenseMap.h"
@@ -39,9 +37,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstddef>
 #include <optional>
-#include <set>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -186,7 +182,8 @@ llvm::Expected<std::string> qualifyAllDecls(const FunctionDecl *FD,
           return;
 
         const std::string Qualifier = getQualification(
-            FD->getASTContext(), TargetContext, Target->getBeginLoc(), ND);
+            FD->getASTContext(), Resolver, TargetContext,
+            DynTypedNode::create(*Target), Target->getBeginLoc(), ND);
         if (auto Err = Replacements.add(
                 tooling::Replacement(SM, Ref.NameLoc, 0, Qualifier))) {
           HadErrors = true;
