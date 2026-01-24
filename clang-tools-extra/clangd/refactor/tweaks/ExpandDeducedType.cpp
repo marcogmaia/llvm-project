@@ -259,6 +259,42 @@ std::string injectQualifier(llvm::StringRef TypeString,
   return TypeString.str();
 }
 
+// Determines the string representation of the deduced type, including
+// qualification and handling of declarators.
+llvm::Expected<std::string>
+computeDeducedTypeName(ASTContext &Ctx, const DeclContext &CurContext,
+                       const SelectionTree::Node *Node, SourceLocation Loc,
+                       QualType DeducedType) {
+  // Some types aren't written as single chunks of text, e.g:
+  //   auto fptr = &func; // auto is void(*)()
+  // ==>
+  //   void (*fptr)() = &func;
+  // Replacing these requires examining the declarator, we don't support it yet.
+  std::string PrettyDeclarator =
+      printType(DeducedType, CurContext, "DECLARATOR_ID");
+
+  if (const NamedDecl *ND = resolveTagOrTemplateDecl(DeducedType)) {
+    if (ND->getIdentifier()) {
+      std::string QualifiedName =
+          getQualifiedName(Ctx, &CurContext, Node, Loc, ND);
+      if (QualifiedName != ND->getNameAsString()) {
+        llvm::StringRef ShortName = PrettyDeclarator;
+        if (ShortName.consume_back("DECLARATOR_ID")) {
+          std::string NewDeclarator =
+              injectQualifier(ShortName, ND->getName(), QualifiedName);
+          if (NewDeclarator != ShortName)
+            PrettyDeclarator = NewDeclarator + " DECLARATOR_ID";
+        }
+      }
+    }
+  }
+
+  llvm::StringRef PrettyTypeName = PrettyDeclarator;
+  if (!PrettyTypeName.consume_back("DECLARATOR_ID"))
+    return error("Could not expand type that isn't a simple string");
+  return PrettyTypeName.rtrim().str();
+}
+
 /// Expand the "auto" type to the derived type
 /// Before:
 ///    auto x = Something();
@@ -387,44 +423,18 @@ Expected<Tweak::Effect> ExpandDeducedType::apply(const Selection &Inputs) {
   if ((*DeducedType)->isDependentType())
     return error("Could not expand a dependent type");
 
-  // Some types aren't written as single chunks of text, e.g:
-  //   auto fptr = &func; // auto is void(*)()
-  // ==>
-  //   void (*fptr)() = &func;
-  // Replacing these requires examining the declarator, we don't support it yet.
   const DeclContext &CurContext =
       Inputs.ASTSelection.commonAncestor()->getDeclContext();
 
-  std::string PrettyDeclarator =
-      printType(*DeducedType, CurContext, "DECLARATOR_ID");
+  auto PrettyTypeName = computeDeducedTypeName(
+      Inputs.AST->getASTContext(), CurContext,
+      Inputs.ASTSelection.commonAncestor(), Range.getBegin(), *DeducedType);
 
-  // If the deduced type is a simple record/enum or a template specialization,
-  // we can try to improve the qualification if it's currently ambiguous.
-  if (const NamedDecl *ND = resolveTagOrTemplateDecl(*DeducedType)) {
-    if (ND->getIdentifier()) {
-      std::string QualifiedName = getQualifiedName(
-          Inputs.AST->getASTContext(), &CurContext,
-          Inputs.ASTSelection.commonAncestor(), Range.getBegin(), ND);
-
-      if (QualifiedName != ND->getNameAsString()) {
-        llvm::StringRef ShortName = PrettyDeclarator;
-        if (ShortName.consume_back("DECLARATOR_ID")) {
-          std::string NewDeclarator =
-              injectQualifier(ShortName, ND->getName(), QualifiedName);
-          if (NewDeclarator != ShortName)
-            PrettyDeclarator = NewDeclarator + " DECLARATOR_ID";
-        }
-      }
-    }
-  }
-
-  llvm::StringRef PrettyTypeName = PrettyDeclarator;
-  if (!PrettyTypeName.consume_back("DECLARATOR_ID"))
-    return error("Could not expand type that isn't a simple string");
-  PrettyTypeName = PrettyTypeName.rtrim();
+  if (!PrettyTypeName)
+    return PrettyTypeName.takeError();
 
   tooling::Replacement Expansion(SrcMgr, CharSourceRange(Range, true),
-                                 PrettyTypeName);
+                                 *PrettyTypeName);
 
   return Effect::mainFileEdit(SrcMgr, tooling::Replacements(Expansion));
 }
