@@ -21,6 +21,7 @@
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Lex/MacroInfo.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include <optional>
 #include <string>
@@ -260,6 +261,12 @@ bool isLikelyForwardingFunction(const FunctionTemplateDecl *FT);
 /// constructors that might be forwarded to.
 SmallVector<const CXXConstructorDecl *, 1>
 searchConstructorsInForwardingFunction(const FunctionDecl *FD);
+
+// Store all UsingDirectiveDecls in parent contexts of DestContext, that were
+// introduced before Until.
+llvm::DenseSet<const NamespaceDecl *>
+getUsingNamespaceDirectives(const DeclContext *DestContext,
+                            SourceLocation Until);
 
 } // namespace clangd
 } // namespace clang

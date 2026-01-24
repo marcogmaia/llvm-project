@@ -15,7 +15,6 @@
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
-#include "llvm/ADT/DenseSet.h"
 #include <optional>
 #include <string>
 
@@ -23,26 +22,13 @@ namespace clang {
 namespace clangd {
 namespace {
 
-// Copied from AST.cpp since it's not public.
-llvm::DenseSet<const NamespaceDecl *>
-getUsingNamespaceDirectives(const DeclContext *DestContext,
-                            SourceLocation Until) {
-  const auto &SM = DestContext->getParentASTContext().getSourceManager();
-  llvm::DenseSet<const NamespaceDecl *> VisibleNamespaceDecls;
-  for (const auto *DC = DestContext; DC; DC = DC->getLookupParent()) {
-    for (const auto *D : DC->decls()) {
-      if (!SM.isWrittenInSameFile(D->getLocation(), Until) ||
-          !SM.isBeforeInTranslationUnit(D->getLocation(), Until))
-        continue;
-      if (auto *UDD = llvm::dyn_cast<UsingDirectiveDecl>(D))
-        VisibleNamespaceDecls.insert(
-            UDD->getNominatedNamespace()->getCanonicalDecl());
-    }
-  }
-  return VisibleNamespaceDecls;
-}
-
-enum class QualificationStrategy { Prefix, Full };
+enum class QualificationStrategy {
+  // To qualify by expanding the minimum necessary qualification based on the
+  // current namespace.
+  Prefix,
+  // To expand the full qualification.
+  Full,
+};
 
 // Checks if the 'Name' is defined in 'Context' and refers to something other
 // than 'Target'.

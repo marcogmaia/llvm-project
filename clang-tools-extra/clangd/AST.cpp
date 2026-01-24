@@ -77,26 +77,6 @@ bool isTemplateSpecializationKind(const NamedDecl *D,
          isTemplateSpecializationKind<VarDecl>(D, Kind);
 }
 
-// Store all UsingDirectiveDecls in parent contexts of DestContext, that were
-// introduced before InsertionPoint.
-llvm::DenseSet<const NamespaceDecl *>
-getUsingNamespaceDirectives(const DeclContext *DestContext,
-                            SourceLocation Until) {
-  const auto &SM = DestContext->getParentASTContext().getSourceManager();
-  llvm::DenseSet<const NamespaceDecl *> VisibleNamespaceDecls;
-  for (const auto *DC = DestContext; DC; DC = DC->getLookupParent()) {
-    for (const auto *D : DC->decls()) {
-      if (!SM.isWrittenInSameFile(D->getLocation(), Until) ||
-          !SM.isBeforeInTranslationUnit(D->getLocation(), Until))
-        continue;
-      if (auto *UDD = llvm::dyn_cast<UsingDirectiveDecl>(D))
-        VisibleNamespaceDecls.insert(
-            UDD->getNominatedNamespace()->getCanonicalDecl());
-    }
-  }
-  return VisibleNamespaceDecls;
-}
-
 // Goes over all parents of SourceContext until we find a common ancestor for
 // DestContext and SourceContext. Any qualifier including and above common
 // ancestor is redundant, therefore we stop at lowest common ancestor.
@@ -692,6 +672,26 @@ std::vector<const Attr *> getAttributes(const DynTypedNode &N) {
         Result.push_back(A);
   }
   return Result;
+}
+
+// Store all UsingDirectiveDecls in parent contexts of DestContext, that were
+// introduced before Until.
+llvm::DenseSet<const NamespaceDecl *>
+getUsingNamespaceDirectives(const DeclContext *DestContext,
+                            SourceLocation Until) {
+  const auto &SM = DestContext->getParentASTContext().getSourceManager();
+  llvm::DenseSet<const NamespaceDecl *> VisibleNamespaceDecls;
+  for (const auto *DC = DestContext; DC; DC = DC->getLookupParent()) {
+    for (const auto *D : DC->decls()) {
+      if (!SM.isWrittenInSameFile(D->getLocation(), Until) ||
+          !SM.isBeforeInTranslationUnit(D->getLocation(), Until))
+        continue;
+      if (auto *UDD = llvm::dyn_cast<UsingDirectiveDecl>(D))
+        VisibleNamespaceDecls.insert(
+            UDD->getNominatedNamespace()->getCanonicalDecl());
+    }
+  }
+  return VisibleNamespaceDecls;
 }
 
 std::string getQualification(ASTContext &Context,
