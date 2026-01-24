@@ -95,13 +95,6 @@ bool shadowsInFunctionDecl(const FunctionDecl *FD, const NamedDecl *Target) {
 // starting from 'Node' (in 'SelectionTree') up to the 'CurContext'.
 bool isShadowed(const NamedDecl *Target, const DeclContext *CurContext,
                 const SelectionTree::Node *Node) {
-  // Check for shadowing in the current DeclContext chain (up to TU).
-  for (const DeclContext *DC = CurContext; DC && !DC->isTranslationUnit();
-       DC = DC->getLookupParent()) {
-    if (hasNameCollision(DC, Target))
-      return true;
-  }
-
   // Check for shadowing in local scopes (function bodies, blocks)
   // which are not captured by DeclContext lookup.
   for (const SelectionTree::Node *Parent = Node->Parent; Parent;
@@ -114,6 +107,15 @@ bool isShadowed(const NamedDecl *Target, const DeclContext *CurContext,
         return true;
     }
   }
+
+  // Check for shadowing in the current DeclContext chain (up to TU).
+  for (const DeclContext *DC = CurContext; DC; DC = DC->getLookupParent()) {
+    if (hasNameCollision(DC, Target))
+      return true;
+    if (DC == Target->getDeclContext())
+      return false;
+  }
+
   return false;
 }
 
@@ -154,36 +156,26 @@ QualificationStrategy computeStrategy(ASTContext &Context,
                                       std::string &Prefix) {
   Prefix = getQualification(Context, CurContext, Loc, ND);
 
-  // If Qualification is empty, we must ensure that the simple name is NOT
-  // ambiguous in the current context (e.g. via 'using namespace').
-  if (Prefix.empty()) {
-    bool IsAmbiguous = false;
-    // Check for ambiguity with global scope
-    const auto *TU = Context.getTranslationUnitDecl();
-    if (hasNameCollision(TU, ND))
-      IsAmbiguous = true;
+  // If we already have a qualification, we trust it.
+  if (!Prefix.empty())
+    return QualificationStrategy::Prefix;
 
-    // Check for shadowing in the current scope chain
-    if (!IsAmbiguous && isShadowed(ND, CurContext, Node))
-      IsAmbiguous = true;
+  // We must ensure that the simple name is NOT ambiguous in the current context
+  // (e.g. via 'using namespace' or shadowing).
+  if (isShadowed(ND, CurContext, Node)) {
+    if (canUseParentPrefix(ND, CurContext, Node, Prefix))
+      return QualificationStrategy::Prefix;
+    return QualificationStrategy::Full;
+  }
 
-    // Check visible namespaces
-    if (!IsAmbiguous) {
-      auto VisibleNS = getUsingNamespaceDirectives(CurContext, Loc);
-      for (const auto *NS : VisibleNS) {
-        if (hasNameCollision(NS, ND)) {
-          IsAmbiguous = true;
-          break;
-        }
-      }
-    }
-
-    if (IsAmbiguous) {
+  for (const auto *NS : getUsingNamespaceDirectives(CurContext, Loc)) {
+    if (hasNameCollision(NS, ND)) {
       if (canUseParentPrefix(ND, CurContext, Node, Prefix))
         return QualificationStrategy::Prefix;
       return QualificationStrategy::Full;
     }
   }
+
   return QualificationStrategy::Prefix;
 }
 
@@ -208,47 +200,49 @@ std::string getQualifiedName(ASTContext &Context, const DeclContext *CurContext,
 std::string injectQualifier(llvm::StringRef TypeString,
                             llvm::StringRef UnqualifiedName,
                             llvm::StringRef QualifiedName) {
-  llvm::StringRef ShortName = TypeString;
-  ShortName = ShortName.rtrim();
+  llvm::StringRef ShortName = TypeString.rtrim();
 
   // Find the name in the string.
   // We need to be careful not to match substrings (e.g. "Names" vs "Name").
   // We also need to handle qualifiers (const/volatile) and pointers/refs.
   size_t Pos = ShortName.find(UnqualifiedName);
-  if (Pos != llvm::StringRef::npos) {
-    // Check if it's a whole word match.
-    bool StartOk =
-        (Pos == 0) || !isAsciiIdentifierContinue(
-                          static_cast<unsigned char>(ShortName[Pos - 1]));
-    bool EndOk = (Pos + UnqualifiedName.size() == ShortName.size()) ||
-                 !isAsciiIdentifierContinue(static_cast<unsigned char>(
-                     ShortName[Pos + UnqualifiedName.size()]));
+  if (Pos == llvm::StringRef::npos)
+    return TypeString.str();
 
-    if (StartOk && EndOk) {
-      if (!QualifiedName.empty() && QualifiedName != UnqualifiedName) {
-        // We have a qualified name, check if the current name is already
-        // fully qualified.
-        // We do this by checking if the text *before* the match ends with
-        // the qualification prefix.
-        // e.g. QualifiedName = "ns::Class::Nested", UnqualifiedName = "Nested"
-        // ExpectedPrefix = "ns::Class::"
-        // ShortName = "ns::Class::Nested" -> Pos of Nested is 11.
-        // ShortName.substr(0, 11) is "ns::Class::", which matches.
+  // Check if it's a whole word match.
+  bool StartOk =
+      (Pos == 0) || !isAsciiIdentifierContinue(
+                        static_cast<unsigned char>(ShortName[Pos - 1]));
+  bool EndOk = (Pos + UnqualifiedName.size() == ShortName.size()) ||
+               !isAsciiIdentifierContinue(static_cast<unsigned char>(
+                   ShortName[Pos + UnqualifiedName.size()]));
 
-        // Handle "::" global scope properly
-        llvm::StringRef ExpectedPrefix = QualifiedName;
-        if (ExpectedPrefix.ends_with(UnqualifiedName))
-          ExpectedPrefix = ExpectedPrefix.drop_back(UnqualifiedName.size());
+  if (!StartOk || !EndOk)
+    return TypeString.str();
 
-        if (!ShortName.substr(0, Pos).ends_with(ExpectedPrefix)) {
-          return (ShortName.take_front(Pos) + ExpectedPrefix +
-                  ShortName.drop_front(Pos))
-              .str();
-        }
-      }
-    }
-  }
-  return TypeString.str();
+  if (QualifiedName.empty() || QualifiedName == UnqualifiedName)
+    return TypeString.str();
+
+  // We have a qualified name, check if the current name is already
+  // fully qualified.
+  // We do this by checking if the text *before* the match ends with
+  // the qualification prefix.
+  // e.g. QualifiedName = "ns::Class::Nested", UnqualifiedName = "Nested"
+  // ExpectedPrefix = "ns::Class::"
+  // ShortName = "ns::Class::Nested" -> Pos of Nested is 11.
+  // ShortName.substr(0, 11) is "ns::Class::", which matches.
+
+  // Handle "::" global scope properly
+  llvm::StringRef ExpectedPrefix = QualifiedName;
+  if (ExpectedPrefix.ends_with(UnqualifiedName))
+    ExpectedPrefix = ExpectedPrefix.drop_back(UnqualifiedName.size());
+
+  if (ShortName.substr(0, Pos).ends_with(ExpectedPrefix))
+    return TypeString.str();
+
+  return (ShortName.take_front(Pos) + ExpectedPrefix +
+          ShortName.drop_front(Pos))
+      .str();
 }
 
 const NamedDecl *resolveTagOrTemplateDecl(QualType Type) {
@@ -273,19 +267,22 @@ computeDeducedTypeName(ASTContext &Ctx, const DeclContext &CurContext,
   std::string PrettyDeclarator =
       printType(DeducedType, CurContext, "DECLARATOR_ID");
 
-  if (const NamedDecl *ND = resolveTagOrTemplateDecl(DeducedType)) {
-    if (ND->getIdentifier()) {
-      std::string QualifiedName =
-          getQualifiedName(Ctx, &CurContext, Node, Loc, ND);
-      if (QualifiedName != ND->getNameAsString()) {
-        llvm::StringRef ShortName = PrettyDeclarator;
-        if (ShortName.consume_back("DECLARATOR_ID")) {
-          std::string NewDeclarator =
-              injectQualifier(ShortName, ND->getName(), QualifiedName);
-          if (NewDeclarator != ShortName)
-            PrettyDeclarator = NewDeclarator + " DECLARATOR_ID";
-        }
-      }
+  const NamedDecl *ND = resolveTagOrTemplateDecl(DeducedType);
+  if (!ND || !ND->getIdentifier()) {
+    llvm::StringRef PrettyTypeName = PrettyDeclarator;
+    if (!PrettyTypeName.consume_back("DECLARATOR_ID"))
+      return error("Could not expand type that isn't a simple string");
+    return PrettyTypeName.rtrim().str();
+  }
+
+  std::string QualifiedName = getQualifiedName(Ctx, &CurContext, Node, Loc, ND);
+  if (QualifiedName != ND->getNameAsString()) {
+    llvm::StringRef ShortName = PrettyDeclarator;
+    if (ShortName.consume_back("DECLARATOR_ID")) {
+      std::string NewDeclarator =
+          injectQualifier(ShortName, ND->getName(), QualifiedName);
+      if (NewDeclarator != ShortName)
+        PrettyDeclarator = NewDeclarator + " DECLARATOR_ID";
     }
   }
 
