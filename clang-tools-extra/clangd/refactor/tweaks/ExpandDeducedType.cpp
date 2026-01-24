@@ -42,14 +42,6 @@ getUsingNamespaceDirectives(const DeclContext *DestContext,
   return VisibleNamespaceDecls;
 }
 
-const NamedDecl *resolveTagOrTemplateDecl(QualType Type) {
-  if (const auto *TT = Type->getAs<TagType>())
-    return TT->getDecl();
-  if (const auto *TST = Type->getAs<TemplateSpecializationType>())
-    return TST->getTemplateName().getAsTemplateDecl();
-  return nullptr;
-}
-
 enum class QualificationStrategy { Prefix, Full };
 
 // Checks if the 'Name' is defined in 'Context' and refers to something other
@@ -259,6 +251,14 @@ std::string injectQualifier(llvm::StringRef TypeString,
   return TypeString.str();
 }
 
+const NamedDecl *resolveTagOrTemplateDecl(QualType Type) {
+  if (const auto *TT = Type->getAs<TagType>())
+    return TT->getDecl();
+  if (const auto *TST = Type->getAs<TemplateSpecializationType>())
+    return TST->getTemplateName().getAsTemplateDecl();
+  return nullptr;
+}
+
 // Determines the string representation of the deduced type, including
 // qualification and handling of declarators.
 llvm::Expected<std::string>
@@ -426,7 +426,7 @@ Expected<Tweak::Effect> ExpandDeducedType::apply(const Selection &Inputs) {
   const DeclContext &CurContext =
       Inputs.ASTSelection.commonAncestor()->getDeclContext();
 
-  auto PrettyTypeName = computeDeducedTypeName(
+  llvm::Expected<std::string> PrettyTypeName = computeDeducedTypeName(
       Inputs.AST->getASTContext(), CurContext,
       Inputs.ASTSelection.commonAncestor(), Range.getBegin(), *DeducedType);
 
