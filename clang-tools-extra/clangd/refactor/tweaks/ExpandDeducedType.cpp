@@ -50,190 +50,168 @@ const NamedDecl *resolveTagOrTemplateDecl(QualType Type) {
   return nullptr;
 }
 
-struct DeducedTypeVisitor {
-  enum class QualificationStrategy { Prefix, Full };
+enum class QualificationStrategy { Prefix, Full };
 
-  // Checks if the 'Name' is defined in 'Context' and refers to something other
-  // than 'Target'.
-  static bool hasNameCollision(const DeclContext *Context,
-                               const NamedDecl *Target) {
-    for (const auto *D : Context->lookup(Target->getDeclName())) {
-      if (D != Target && D->getCanonicalDecl() != Target->getCanonicalDecl())
-        return true;
-    }
-    return false;
+// Checks if the 'Name' is defined in 'Context' and refers to something other
+// than 'Target'.
+bool hasNameCollision(const DeclContext *Context, const NamedDecl *Target) {
+  for (const auto *D : Context->lookup(Target->getDeclName())) {
+    if (D != Target && D->getCanonicalDecl() != Target->getCanonicalDecl())
+      return true;
   }
+  return false;
+}
 
-  // Check if any declaration in the DeclStmt collides with Target.
-  static bool shadowsInDeclStmt(const DeclStmt *DS, const NamedDecl *Target) {
-    for (const Decl *D : DS->decls()) {
-      if (const auto *NdLocal = dyn_cast<NamedDecl>(D)) {
-        // Ignore the target itself (we don't shadow ourselves).
-        if (NdLocal->getCanonicalDecl() == Target->getCanonicalDecl())
-          continue;
-        if (NdLocal->getDeclName() == Target->getDeclName())
-          return true;
-      }
-    }
-    return false;
-  }
-
-  // Check for shadowing within a CompoundStmt up to the current node.
-  static bool shadowsInCompoundStmt(const CompoundStmt *CS,
-                                    const Stmt *CurrentNode,
-                                    const NamedDecl *Target) {
-    for (const Stmt *S : CS->body()) {
-      if (S == CurrentNode)
-        break;
-      if (const auto *DS = dyn_cast<DeclStmt>(S)) {
-        if (shadowsInDeclStmt(DS, Target))
-          return true;
-      }
-    }
-    return false;
-  }
-
-  // Check if function parameters shadow the target.
-  static bool shadowsInFunctionDecl(const FunctionDecl *FD,
-                                    const NamedDecl *Target) {
-    for (const auto *P : FD->parameters()) {
-      if (P->getDeclName() == Target->getDeclName())
-        return true;
-    }
-    return false;
-  }
-
-  // Checks if 'Target' is shadowed by a local declaration in the scope chain
-  // starting from 'Node' (in 'SelectionTree') up to the 'CurContext'.
-  static bool isShadowed(const NamedDecl *Target, const DeclContext *CurContext,
-                         const SelectionTree::Node *Node) {
-    // Check for shadowing in the current DeclContext chain (up to TU).
-    for (const DeclContext *DC = CurContext; DC && !DC->isTranslationUnit();
-         DC = DC->getLookupParent()) {
-      if (hasNameCollision(DC, Target))
-        return true;
-    }
-
-    // Check for shadowing in local scopes (function bodies, blocks)
-    // which are not captured by DeclContext lookup.
-    for (const SelectionTree::Node *Parent = Node->Parent; Parent;
-         Node = Parent, Parent = Parent->Parent) {
-      if (const auto *CS = Parent->ASTNode.get<CompoundStmt>()) {
-        if (shadowsInCompoundStmt(CS, Node->ASTNode.get<Stmt>(), Target))
-          return true;
-      } else if (const auto *FD = Parent->ASTNode.get<FunctionDecl>()) {
-        if (shadowsInFunctionDecl(FD, Target))
-          return true;
-      }
-    }
-    return false;
-  }
-
-  // Check if we can use the immediate parent namespace as a prefix.
-  static bool canUseParentPrefix(const NamedDecl *Target,
-                                 const DeclContext *CurContext,
-                                 const SelectionTree::Node *Node,
-                                 std::string &Prefix) {
-    // Walk up the DeclContexts of the Target to find the first safe prefix
-    const DeclContext *DC = Target->getDeclContext();
-    std::string AccumPrefix = "";
-
-    while (DC && !DC->isTranslationUnit()) {
-      const auto *NS = dyn_cast<NamespaceDecl>(DC);
-      if (!NS || NS->isAnonymousNamespace() || NS->isInlineNamespace()) {
-        DC = DC->getParent();
+// Check if any declaration in the DeclStmt collides with Target.
+bool shadowsInDeclStmt(const DeclStmt *DS, const NamedDecl *Target) {
+  for (const Decl *D : DS->decls()) {
+    if (const auto *NdLocal = dyn_cast<NamedDecl>(D)) {
+      // Ignore the target itself (we don't shadow ourselves).
+      if (NdLocal->getCanonicalDecl() == Target->getCanonicalDecl())
         continue;
-      }
-
-      AccumPrefix = NS->getNameAsString() + "::" + AccumPrefix;
-
-      // Check if this accumulated prefix is safe (not shadowed and no
-      // collisions) We need to check if the *first* component of the prefix is
-      // shadowed. Actually, we need to check if the fully formed Name with this
-      // prefix resolves to the Target. But simply checking if the top-level
-      // namespace in the prefix is safe is a good heuristic for "Is this path
-      // valid?".
-
-      // However, isShadowed/hasNameCollision expects a NamedDecl.
-      // We should check if 'NS' (the top of the chain we just added) is safe.
-      // But 'NS' is the *inner* namespace in the previous loop iteration?
-      // No, we are walking UP from Target.
-      // Iteration 1: DC = Parent of Target. AccumPrefix = "Parent::".
-      // Iteration 2: DC = GrandParent. AccumPrefix = "GrandParent::Parent::".
-
-      // If we use "GrandParent::Parent::", we need "GrandParent" to be
-      // visible/safe.
-      if (!isShadowed(NS, CurContext, Node) &&
-          !hasNameCollision(CurContext, NS)) {
-        Prefix = AccumPrefix;
+      if (NdLocal->getDeclName() == Target->getDeclName())
         return true;
-      }
+    }
+  }
+  return false;
+}
 
+// Check for shadowing within a CompoundStmt up to the current node.
+bool shadowsInCompoundStmt(const CompoundStmt *CS, const Stmt *CurrentNode,
+                           const NamedDecl *Target) {
+  for (const Stmt *S : CS->body()) {
+    if (S == CurrentNode)
+      break;
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      if (shadowsInDeclStmt(DS, Target))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Check if function parameters shadow the target.
+bool shadowsInFunctionDecl(const FunctionDecl *FD, const NamedDecl *Target) {
+  for (const auto *P : FD->parameters()) {
+    if (P->getDeclName() == Target->getDeclName())
+      return true;
+  }
+  return false;
+}
+
+// Checks if 'Target' is shadowed by a local declaration in the scope chain
+// starting from 'Node' (in 'SelectionTree') up to the 'CurContext'.
+bool isShadowed(const NamedDecl *Target, const DeclContext *CurContext,
+                const SelectionTree::Node *Node) {
+  // Check for shadowing in the current DeclContext chain (up to TU).
+  for (const DeclContext *DC = CurContext; DC && !DC->isTranslationUnit();
+       DC = DC->getLookupParent()) {
+    if (hasNameCollision(DC, Target))
+      return true;
+  }
+
+  // Check for shadowing in local scopes (function bodies, blocks)
+  // which are not captured by DeclContext lookup.
+  for (const SelectionTree::Node *Parent = Node->Parent; Parent;
+       Node = Parent, Parent = Parent->Parent) {
+    if (const auto *CS = Parent->ASTNode.get<CompoundStmt>()) {
+      if (shadowsInCompoundStmt(CS, Node->ASTNode.get<Stmt>(), Target))
+        return true;
+    } else if (const auto *FD = Parent->ASTNode.get<FunctionDecl>()) {
+      if (shadowsInFunctionDecl(FD, Target))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Tries to find a partial namespace prefix from the target's enclosing
+// namespaces that resolves ambiguity or shadowing.
+bool canUseParentPrefix(const NamedDecl *Target, const DeclContext *CurContext,
+                        const SelectionTree::Node *Node, std::string &Prefix) {
+  const DeclContext *DC = Target->getDeclContext();
+  std::string AccumPrefix = "";
+
+  while (DC && !DC->isTranslationUnit()) {
+    const auto *NS = dyn_cast<NamespaceDecl>(DC);
+    if (!NS || NS->isAnonymousNamespace() || NS->isInlineNamespace()) {
       DC = DC->getParent();
+      continue;
     }
 
-    return false;
-  }
+    AccumPrefix = NS->getNameAsString() + "::" + AccumPrefix;
 
-  // Determines the qualification strategy for 'ND' at 'Loc'.
-  static QualificationStrategy
-  computeStrategy(ASTContext &Context, const DeclContext *CurContext,
-                  const SelectionTree::Node *Node, SourceLocation Loc,
-                  const NamedDecl *ND, std::string &Prefix) {
-    Prefix = getQualification(Context, CurContext, Loc, ND);
-
-    // If Qualification is empty, we must ensure that the simple name is NOT
-    // ambiguous in the current context (e.g. via 'using namespace').
-    if (Prefix.empty()) {
-      bool IsAmbiguous = false;
-      // Check for ambiguity with global scope
-      const auto *TU = Context.getTranslationUnitDecl();
-      if (hasNameCollision(TU, ND))
-        IsAmbiguous = true;
-
-      // Check for shadowing in the current scope chain
-      if (!IsAmbiguous && isShadowed(ND, CurContext, Node))
-        IsAmbiguous = true;
-
-      // Check visible namespaces
-      if (!IsAmbiguous) {
-        auto VisibleNS = getUsingNamespaceDirectives(CurContext, Loc);
-        for (const auto *NS : VisibleNS) {
-          if (hasNameCollision(NS, ND)) {
-            IsAmbiguous = true;
-            break;
-          }
-        }
-      }
-
-      if (IsAmbiguous) {
-        if (canUseParentPrefix(ND, CurContext, Node, Prefix))
-          return QualificationStrategy::Prefix;
-        return QualificationStrategy::Full;
-      }
+    if (!isShadowed(NS, CurContext, Node) &&
+        !hasNameCollision(CurContext, NS)) {
+      // The outermost namespace of the current prefix is accessible.
+      Prefix = AccumPrefix;
+      return true;
     }
-    return QualificationStrategy::Prefix;
+
+    DC = DC->getParent();
   }
 
-  static std::string getQualifiedName(ASTContext &Context,
+  return false;
+}
+
+// Determines the qualification strategy for 'ND' at 'Loc'.
+QualificationStrategy computeStrategy(ASTContext &Context,
                                       const DeclContext *CurContext,
                                       const SelectionTree::Node *Node,
-                                      SourceLocation Loc, const NamedDecl *ND) {
-    std::string Prefix;
-    QualificationStrategy Strategy =
-        computeStrategy(Context, CurContext, Node, Loc, ND, Prefix);
+                                      SourceLocation Loc, const NamedDecl *ND,
+                                      std::string &Prefix) {
+  Prefix = getQualification(Context, CurContext, Loc, ND);
 
-    if (Strategy == QualificationStrategy::Full) {
-      std::string FQName;
-      llvm::raw_string_ostream OS(FQName);
-      ND->printQualifiedName(OS);
-      if (ND->getDeclContext()->isTranslationUnit())
-        return "::" + OS.str();
-      return OS.str();
+  // If Qualification is empty, we must ensure that the simple name is NOT
+  // ambiguous in the current context (e.g. via 'using namespace').
+  if (Prefix.empty()) {
+    bool IsAmbiguous = false;
+    // Check for ambiguity with global scope
+    const auto *TU = Context.getTranslationUnitDecl();
+    if (hasNameCollision(TU, ND))
+      IsAmbiguous = true;
+
+    // Check for shadowing in the current scope chain
+    if (!IsAmbiguous && isShadowed(ND, CurContext, Node))
+      IsAmbiguous = true;
+
+    // Check visible namespaces
+    if (!IsAmbiguous) {
+      auto VisibleNS = getUsingNamespaceDirectives(CurContext, Loc);
+      for (const auto *NS : VisibleNS) {
+        if (hasNameCollision(NS, ND)) {
+          IsAmbiguous = true;
+          break;
+        }
+      }
     }
-    return Prefix + ND->getNameAsString();
+
+    if (IsAmbiguous) {
+      if (canUseParentPrefix(ND, CurContext, Node, Prefix))
+        return QualificationStrategy::Prefix;
+      return QualificationStrategy::Full;
+    }
   }
-};
+  return QualificationStrategy::Prefix;
+}
+
+std::string getQualifiedName(ASTContext &Context, const DeclContext *CurContext,
+                             const SelectionTree::Node *Node,
+                             SourceLocation Loc, const NamedDecl *ND) {
+  std::string Prefix;
+  QualificationStrategy Strategy =
+      computeStrategy(Context, CurContext, Node, Loc, ND, Prefix);
+
+  if (Strategy == QualificationStrategy::Full) {
+    std::string FQName;
+    llvm::raw_string_ostream OS(FQName);
+    ND->printQualifiedName(OS);
+    if (ND->getDeclContext()->isTranslationUnit())
+      return "::" + OS.str();
+    return OS.str();
+  }
+  return Prefix + ND->getNameAsString();
+}
 
 std::string injectQualifier(llvm::StringRef TypeString,
                             llvm::StringRef UnqualifiedName,
@@ -424,7 +402,7 @@ Expected<Tweak::Effect> ExpandDeducedType::apply(const Selection &Inputs) {
   // we can try to improve the qualification if it's currently ambiguous.
   if (const NamedDecl *ND = resolveTagOrTemplateDecl(*DeducedType)) {
     if (ND->getIdentifier()) {
-      std::string QualifiedName = DeducedTypeVisitor::getQualifiedName(
+      std::string QualifiedName = getQualifiedName(
           Inputs.AST->getASTContext(), &CurContext,
           Inputs.ASTSelection.commonAncestor(), Range.getBegin(), ND);
 

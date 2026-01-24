@@ -146,93 +146,86 @@ TEST_F(ExpandDeducedTypeTest, Test) {
 }
 
 TEST_F(ExpandDeducedTypeTest, ShadowedTypes) {
+  Header = R"cpp(
+    struct S {};
+    struct G {};
+    template <typename T> struct V {};
+
+    S f_S();
+    const S& f_S_ref();
+
+    namespace n {
+      struct S {};
+      struct G {};
+      template <typename T> struct V {};
+
+      namespace m {
+        struct S {};
+        S f();
+        S func();
+      }
+
+      G f_G();
+      V<int> f_V();
+    }
+  )cpp";
+
   // qualification of shadowed types
-  Header = "namespace n { struct S {}; namespace m { struct S {}; S f(); } }";
   EXPECT_EQ(apply("namespace n { [[auto]] x = m::f(); }"),
             "namespace n { m::S x = m::f(); }");
   EXPECT_EQ(apply("using namespace n; [[auto]] x = m::f();"),
             "using namespace n; m::S x = m::f();");
+
   // global shadowing
-  Header = "struct G {}; namespace n { struct G {}; G f(); }";
-  EXPECT_EQ(apply("using namespace n; [[auto]] x = f();"),
-            "using namespace n; n::G x = f();");
+  EXPECT_EQ(apply("using namespace n; [[auto]] x = f_G();"),
+            "using namespace n; n::G x = f_G();");
+
   // local shadowing
-  Header = "struct S {}; S f();";
-  EXPECT_EQ(apply("void test() { struct S {}; [[auto]] x = f(); }"),
-            "void test() { struct S {}; ::S x = f(); }");
+  EXPECT_EQ(apply("void test() { struct S {}; [[auto]] x = f_S(); }"),
+            "void test() { struct S {}; ::S x = f_S(); }");
+
   // template shadowing
-  Header = "template <typename T> struct V {}; namespace n { template "
-           "<typename T> struct V {}; V<int> f(); }";
-  EXPECT_EQ(apply("using namespace n; [[auto]] x = f();"),
-            "using namespace n; n::V<int> x = f();");
+  EXPECT_EQ(apply("using namespace n; [[auto]] x = f_V();"),
+            "using namespace n; n::V<int> x = f_V();");
+
   // namespace shadowing
-  Header =
-      "namespace n { struct S {}; namespace m { struct S {}; S func(); } }";
   EXPECT_EQ(apply("namespace n { void f() { [[auto]] x = m::func(); } }"),
             "namespace n { void f() { m::S x = m::func(); } }");
+
   // const-ref shadowing
-  Header = "struct S {}; const S& f();";
-  EXPECT_EQ(apply("void test() { struct S {}; [[auto]]& x = f(); }"),
-            "void test() { struct S {}; const ::S& x = f(); }");
+  EXPECT_EQ(apply("void test() { struct S {}; [[auto]]& x = f_S_ref(); }"),
+            "void test() { struct S {}; const ::S& x = f_S_ref(); }");
+}
 
-  Header = "";
-  EXPECT_EQ(apply(R"cpp(namespace outer {
-namespace n {
+TEST_F(ExpandDeducedTypeTest, NestedNamespaces) {
+  EXPECT_EQ(apply(R"cpp(namespace o { namespace n {
 struct S {};
 namespace m {
 struct S {};
-constexpr n::S func() {
-  return n::S{};
-}
-constexpr [[auto]] var = m::func();
-}  // namespace m
-}  // namespace n
-}  // namespace outer
-)cpp"),
-            R"cpp(namespace outer {
-namespace n {
+n::S f() { return n::S{}; }
+[[auto]] x = f();
+} } })cpp"),
+            R"cpp(namespace o { namespace n {
 struct S {};
 namespace m {
 struct S {};
-constexpr n::S func() {
-  return n::S{};
+n::S f() { return n::S{}; }
+n::S x = f();
+} } })cpp");
 }
-constexpr n::S var = m::func();
-}  // namespace m
-}  // namespace n
-}  // namespace outer
-)cpp");
 
-  // check iterative qualification (2 hops)
-  Header = R"cpp(
-    namespace grandparent {
-      namespace parent {
-        struct S {};
-      }
-    }
-  )cpp";
-  EXPECT_EQ(apply(R"cpp(
-    namespace grandparent {
-      namespace parent {
-        void test() {
-          // Shadow parent locally
-          struct parent {};
-          [[auto]] x = grandparent::parent::S();
-        }
-      }
-    }
-  )cpp"),
-            R"cpp(
-    namespace grandparent {
-      namespace parent {
-        void test() {
-          // Shadow parent locally
-          struct parent {};
-          grandparent::parent::S x = grandparent::parent::S();
-        }
-      }
-    }
-  )cpp");
+TEST_F(ExpandDeducedTypeTest, IterativeQualification) {
+  Header = "namespace gp { namespace p { struct S {}; } }";
+  EXPECT_EQ(apply(R"cpp(namespace gp { namespace p {
+void f() {
+  struct p {};
+  [[auto]] x = gp::p::S();
+} } })cpp"),
+            R"cpp(namespace gp { namespace p {
+void f() {
+  struct p {};
+  gp::p::S x = gp::p::S();
+} } })cpp");
 }
 
 } // namespace
